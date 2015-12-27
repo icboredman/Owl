@@ -83,12 +83,12 @@ void loop()
       {
         // report last RSSI
         case 'r'  : buf[0] = rf22_driver.lastRssi();
-                    radio.sendto(buf, 1, MASTER_ADDRESS);
+                    radio.sendtoWait(buf, 1, MASTER_ADDRESS);
                     break;
                     
         // measure battery voltage
         case 'v'  : MeasureBatteryVoltage((int*)buf);
-                    radio.sendto(buf, 1, MASTER_ADDRESS);
+                    radio.sendtoWait(buf, 1, MASTER_ADDRESS);
                     break;
                     
         // wakeup roomba
@@ -96,7 +96,7 @@ void loop()
                     delay(600);
                     digitalWrite(RMB_WKUP_PIN, HIGH);
                     buf[0] = 'W';
-                    radio.sendto(buf, 1, MASTER_ADDRESS);
+                    radio.sendtoWait(buf, 1, MASTER_ADDRESS);
                     break;
                     
         // pass through a general command to Roomba
@@ -115,12 +115,15 @@ void loop()
                     break;
                     
         // get timed drive/turn status
-        case '#'  : buf[0] = highByte(velocity_duration);
+        case '#'  : buf[0] = bool(velocity_duration);
+                    buf[1] = bool(radius_duration);
+                    radio.sendtoWait(buf, 2, MASTER_ADDRESS);
+/*                  buf[0] = highByte(velocity_duration);
                     buf[1] = lowByte(velocity_duration);
                     buf[2] = highByte(radius_duration);
                     buf[3] = lowByte(radius_duration);
-                    radio.sendto(buf, 4, MASTER_ADDRESS);
-                    break;
+                    radio.sendtoWait(buf, 4, MASTER_ADDRESS);
+*/                  break;
                     
 /*      // toggle IR LED
         case 'l'  : if (irLedState == 0)
@@ -146,8 +149,8 @@ void loop()
   if( Serial.available() )
   {
     byte len = Serial.readBytes(buf, RH_RF22_MAX_MESSAGE_LEN-10);
-    // send to master without ack
-    radio.sendto(buf, len, MASTER_ADDRESS);
+    // send to master with ack
+    radio.sendtoWait(buf, len, MASTER_ADDRESS);
   }
 
   // handle timed maneuvers here
