@@ -386,8 +386,8 @@ void loop()
     // Wait for a message addressed to us from the client
     uint8_t len = sizeof(buf);
     uint8_t from;
-    // receive from Roomba without acknowledgement
-    if( radio.recvfrom(buf, &len, &from) && (from==SLAVE_ADDRESS) )
+    // receive from Roomba with acknowledgement
+    if( radio.recvfromAck(buf, &len, &from) && (from==SLAVE_ADDRESS) )
     {
       if( human_mode )
       {
