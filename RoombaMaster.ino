@@ -4,7 +4,10 @@
 // - sends commands to Roomba via XL4432-SMT transceiver
 // - uses iRobot Roomba 500 Open Interface Specification
 //
-// rev 2.0 - 2015.12.??
+// rev 3.0 - 2016.04.20
+//    - enabled local driving control based on sensory inputs
+//    
+// rev 2.0 - 2015.12.20
 //    - uses RHReliableDatagram class for msg acknowledgement and retransmission
 //    
 // rev 1.0 - 2015.07.18
@@ -141,11 +144,41 @@ void loop()
                     Serial.write('x');  // comm error
                   break;
 
+      // enable local control of driving based on sensors
+      case 'L'  : buf[0] = 'L';
+                  // convert parameter into number
+                  int i;
+                  i = 300;  // 3 sec timeout
+                  while( ! Serial.readBytes(&buf[1],1) )
+                  {
+                    if( --i == 0 )
+                    {
+                      Serial.write('?');  // parameter error
+                      break;
+                    }
+                  }
+                  buf[1] -= '0';
+                  if( buf[1] < 0 || buf[1] > 1 )
+                  {
+                    Serial.write('?');  // parameter error
+                    break;
+                  }
+/*                if( Serial.readBytes(&buf[1], 1) != 1 )
+                  {
+                    Serial.write('?');  // parameter error
+                    break;
+                  }
+*/                if( radio.sendtoWait(buf, 2, SLAVE_ADDRESS) )
+                    Serial.write('!');  // ok
+                  else
+                    Serial.write('x');  // comm error
+                  break;
+
 // *** human mode commands ***
 
       // set IR lamp brightness
       case 'l'  : // convert parameter into number
-                  int i;
+//                int i;
                   i = 300;  // 3 sec timeout
                   while( ! Serial.readBytes(str,1) )
                   {
