@@ -4,7 +4,10 @@
 // - receives commands via attached XL4432-SMT transceiver
 // - SCI communication according to iRobot Roomba 500 Open Interface Specification
 //
-// rev 2.0 - 2015.12.??
+// rev 3.0 - 2016.04.20
+//    - enabled local driving control based on sensory inputs
+//    
+// rev 2.0 - 2015.12.20
 //    - uses RHReliableDatagram class for msg acknowledgement and retransmission
 //
 // rev 1.0 - 2015.07.18
@@ -30,11 +33,32 @@ RH_RF22 rf22_driver;
 // Class to manage message delivery and receipt, using the driver declared above
 RHReliableDatagram radio(rf22_driver, MY_ADDRESS);
 
-uint8_t buf[RH_RF22_MAX_MESSAGE_LEN];
+byte buf[RH_RF22_MAX_MESSAGE_LEN];
 
-//const int irLedPin = 6;
-//uint8_t irLedState;
+int BatteryVoltage(void);
+void Drive(unsigned int velocity, unsigned int radius);
+void ProcessBump(byte packet);
+void ProcessRadioMsg(byte *buf, byte len, byte from);
 
+unsigned int velocity, radius;
+unsigned int velocity_duration, radius_duration;
+unsigned long drive_start_time;
+unsigned long sensor_req_time;
+
+bool local_control;
+bool stop_local_control;
+
+enum eState { 
+  idle, 
+  remote_cmd, 
+  local_backoff, 
+  local_turn 
+} state;
+
+
+/*******************************************************
+ * 
+ *******************************************************/
 void setup() 
 {
   pinMode(RMB_WKUP_PIN, OUTPUT);
@@ -57,135 +81,237 @@ void setup()
     rf22_driver.setTxPower(RH_RF22_TXPOW_14DBM);  // 1, 2, 5, *8*, 11, 14, 17, 20
   }
 
-//pinMode(irLedPin, OUTPUT);
-//analogWrite(irLedPin, 0);
-//irLedState = 0;
-//digitalWrite(irLedPin, irLedState);
+  local_control = false;
+  stop_local_control = false;
+
+  state = idle;
 }
 
 
+/*******************************************************
+ * 
+ *******************************************************/
 void loop()
 {
-  static unsigned int velocity, radius;
-  static unsigned int velocity_duration, radius_duration;
-  static unsigned long drive_start_time;
-
-  // Wait for a message addressed to us from the client
+  // receive radio command from Master
   if( radio.available() )
   {
-    uint8_t len = sizeof(buf);
-    uint8_t from;
+    byte len = sizeof(buf);
+    byte from;
     // receive msg and send acknowledge
     if( radio.recvfromAck(buf, &len, &from) && (from==MASTER_ADDRESS) )
     {
-      // process command
-      switch(buf[0])
-      {
-        // report last RSSI
-        case 'r'  : buf[0] = rf22_driver.lastRssi();
-                    radio.sendtoWait(buf, 1, MASTER_ADDRESS);
-                    break;
-                    
-        // measure battery voltage
-        case 'v'  : MeasureBatteryVoltage((int*)buf);
-                    radio.sendtoWait(buf, 1, MASTER_ADDRESS);
-                    break;
-                    
-        // wakeup roomba
-        case 'W'  : digitalWrite(RMB_WKUP_PIN, LOW);
-                    delay(600);
-                    digitalWrite(RMB_WKUP_PIN, HIGH);
-                    buf[0] = 'W';
-                    radio.sendtoWait(buf, 1, MASTER_ADDRESS);
-                    break;
-                    
-        // pass through a general command to Roomba
-        case '$'  : Serial.write(&buf[1],len-1);
-                    break;
-                    
-        // execute a drive/turn with timing
-        case '~'  : velocity = word( buf[1], buf[2] );
-                    radius = word( buf[3], buf[4] );
-                    velocity_duration = word( buf[5], buf[6] );
-                    radius_duration = word( buf[7], buf[8] );
-                    buf[0] = 137;         // DRIVE command
-                    Serial.write(buf,5);  // buf[1..4] already contain velocity and radius
-                    // record start time
-                    drive_start_time = millis();
-                    break;
-                    
-        // get timed drive/turn status
-        case '#'  : buf[0] = bool(velocity_duration);
-                    buf[1] = bool(radius_duration);
-                    radio.sendtoWait(buf, 2, MASTER_ADDRESS);
-/*                  buf[0] = highByte(velocity_duration);
-                    buf[1] = lowByte(velocity_duration);
-                    buf[2] = highByte(radius_duration);
-                    buf[3] = lowByte(radius_duration);
-                    radio.sendtoWait(buf, 4, MASTER_ADDRESS);
-*/                  break;
-                    
-/*      // toggle IR LED
-        case 'l'  : if (irLedState == 0)
-                    {
-                      irLedState = 1;
-                      strcpy((char*)buf,"LED ON");
-                    }
-                    else
-                    {
-                      irLedState = 0;
-                      strcpy((char*)buf,"LED OFF");
-                    }
-                    digitalWrite(irLedPin, irLedState);
-                    radio.sendto(buf, strlen((char*)buf), MASTER_ADDRESS);
-                    break;
-*/
-        default   : break;
-      }
+      ProcessRadioMsg(buf, len, from);
     }
   }
 
-  // radio out whatever Roomba is telling us
+  // receive serial data from Roomba
   if( Serial.available() )
   {
     byte len = Serial.readBytes(buf, RH_RF22_MAX_MESSAGE_LEN-10);
-    // send to master with ack
-    radio.sendtoWait(buf, len, MASTER_ADDRESS);
+    if( local_control )
+    {
+      ProcessBump(buf[0]);
+      if( stop_local_control )
+      {
+        local_control = false;
+        stop_local_control = false;
+      }
+    }
+    else
+    { // radio out whatever Roomba is telling us
+      radio.sendtoWait(buf, len, MASTER_ADDRESS);
+    }
   }
+
+  // request sensor status
+  if( local_control )
+  { // time to send request again?
+    if( (millis()-sensor_req_time) > 15 ) //[ms]
+    {
+      buf[0] = 142; // single read sensors
+      buf[1] = 7;   // bumper status
+      Serial.write(buf, 2);
+      sensor_req_time = millis();
+    }
+  }
+
 
   // handle timed maneuvers here
-  if( velocity_duration && ((millis()-drive_start_time) > velocity_duration) )
+  if( state == remote_cmd )
   {
-    // full stop, including angle reset
-    buf[0] = 137;
-    buf[1] = 0; // velocity = 0
-    buf[2] = 0;
-    buf[3] = 0; // no turning
-    buf[4] = 0;
-    Serial.write(buf, 5);
-    velocity_duration = 0;
-  }
-
-  if( radius_duration && ((millis()-drive_start_time) > radius_duration) )
-  {
-    // stop turning, preserving forward velocity
-    buf[0] = 137;
-    buf[1] = highByte(velocity);
-    buf[2] = lowByte(velocity);
-    buf[3] = 0; // no turning
-    buf[4] = 0;
-    Serial.write(buf, 5);
-    radius_duration = 0;
+    if( velocity_duration && ((millis()-drive_start_time) > velocity_duration) )
+    {
+      // full stop, including angle reset
+      Drive(0,0);
+      velocity_duration = 0;
+      state = idle;
+    }
+  
+    if( radius_duration && ((millis()-drive_start_time) > radius_duration) )
+    {
+      // stop turning, preserving forward velocity
+      Drive(velocity,0);
+      radius_duration = 0;
+      state = idle;
+    }
   }
 
 }
 
 
-bool MeasureBatteryVoltage(int* vbat)
+/*******************************************************
+ * 
+ *******************************************************/
+void ProcessRadioMsg(byte *buf, byte len, byte from)
+{
+  if( len == 0 )
+    return;
+
+  switch(buf[0])
+  {
+    // report last RSSI
+    case 'r'  : buf[0] = rf22_driver.lastRssi();
+                radio.sendtoWait(buf, 1, MASTER_ADDRESS);
+                break;
+                
+    // measure battery voltage
+    case 'v'  : buf[0] = lowByte( BatteryVoltage() );
+                radio.sendtoWait(buf, 1, MASTER_ADDRESS);
+                break;
+                
+    // wakeup roomba
+    case 'W'  : digitalWrite(RMB_WKUP_PIN, LOW);
+                delay(600);
+                digitalWrite(RMB_WKUP_PIN, HIGH);
+                break;
+                
+    // pass through a general command to Roomba
+    case '$'  : Serial.write(&buf[1],len-1);
+                break;
+                
+    // execute a drive/turn with timing
+    case '~'  : velocity = word(buf[1], buf[2]);
+                radius = word(buf[3], buf[4]);
+                velocity_duration = word(buf[5], buf[6]);
+                radius_duration = word(buf[7], buf[8]);
+                if( state == idle )
+                {
+                  Drive(velocity, radius);
+                  // record start time
+                  drive_start_time = millis();
+                  state = remote_cmd;
+                }
+                break;
+                
+    // get timed drive/turn/bump status
+    case '#'  : buf[0] = state;
+                //buf[0] = bool(velocity_duration);
+                //buf[1] = bool(radius_duration);
+                radio.sendtoWait(buf, 1, MASTER_ADDRESS);
+                break;
+
+    // enable local control of driving based on sensors
+    case 'L'  : if( (bool)buf[1] )
+                { 
+                  if( local_control )
+                    break;
+                  local_control = true;
+                  // send Sensors command
+                  buf[0] = 142; // single read sensors
+                  buf[1] = 7;   // bumper status
+                  Serial.write(buf, 2);
+                  // record start time
+                  sensor_req_time = millis();
+                }
+                else
+                {
+                  if( local_control )
+                    stop_local_control = true;
+                }
+                break;
+
+    default   : break;
+  }
+}
+
+char hex2nib(byte h)
+{
+  if( h <= 9 )
+    return h + '0';
+  else
+    return h + 'A'; 
+}
+
+/*******************************************************
+ * 
+ *******************************************************/
+void ProcessBump(byte packet)
+{
+  static byte bumped_side;
+  static unsigned long turn_start_time;
+
+  switch( state )
+  {
+    case idle         : 
+    case remote_cmd   : if( (packet & 0x03) != 0 )
+                        { // slowly back away
+                          Drive(-50,0);
+                          // remember the bump direction
+                          bumped_side = packet & 0x03;
+                          state = local_backoff;
+                          velocity_duration = radius_duration = 0;
+                        }
+                        break;
+
+    case local_backoff: // make sure we are away from wall
+                        if( (packet & 0x03) == 0 )
+                        {
+                          if( bumped_side & 0x01 ) // right side?
+                            Drive(100,1);   // turn in place counter-clockwise
+                          else
+                            Drive(100,-1);  // turn in place clockwise
+                          // remember turn start time
+                          turn_start_time = millis();
+                          state = local_turn;
+                        }
+                        break;
+
+    case local_turn   : if( (millis()-turn_start_time) > 1000 )  //[ms]
+                        { //end turn
+                          Drive(0,0);
+                          state = idle;
+                        }
+                        break;
+
+    default           : break;
+  }
+
+}
+
+
+/*******************************************************
+ * 
+ *******************************************************/
+void Drive(unsigned int velocity, unsigned int radius)
+{
+  byte cmd[5];
+  cmd[0] = 137; // drive command
+  cmd[1] = highByte(velocity);
+  cmd[2] = lowByte(velocity);
+  cmd[3] = highByte(radius);
+  cmd[4] = lowByte(radius);
+  Serial.write(cmd, 5);
+}
+
+
+/*******************************************************
+ * 
+ *******************************************************/
+int BatteryVoltage()
 {
   int raw = analogRead(RMB_VBAT_PIN);
-  *vbat = raw * 11 / 305;
-  return true;
+  return (raw * 11 / 305);
 }
 
 
